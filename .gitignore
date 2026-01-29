@@ -39,3 +39,7 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Data
+REQUISITOS.md
+facturas/
