@@ -42,4 +42,4 @@ htmlcov/
 
 # Data
 REQUISITOS.md
-facturas/
+facturas/*
