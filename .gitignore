@@ -43,3 +43,8 @@ htmlcov/
 # Data
 REQUISITOS.md
 facturas/*
+
+# IA
+.claude/
+.copilot/
+.cursor/
