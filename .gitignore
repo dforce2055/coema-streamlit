@@ -40,9 +40,8 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
-# Data
-REQUISITOS.md
-facturas/*
+# Data - facturas reales con datos personales
+**/facturas/
 
 # IA
 .claude/

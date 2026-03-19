@@ -1,217 +1,328 @@
 """
-COEMA - Sistema de Facturación Eléctrica
-MVP Demo - Streamlit
-Datos basados en facturas reales Nov-Dic 2025
+COEMA - Motor de Facturación Eléctrica
+Demo con proceso guiado (stepper) para la demo con el cliente.
+Extrae datos tarifarios de PDFs de OCEBA, valida, y calcula facturación.
 """
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from typing import Dict
+import os
+import sys
+import time
+from typing import Dict, List
 
-# ============================================
-# CONFIGURACIÓN Y DATOS REALES
-# ============================================
+# ---------------------------------------------------------------------------
+# Import PDF extractor (same directory)
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pdf_extractor import (
+    extract_tariffs_from_pdf,
+    extract_tariffs_from_bytes,
+    extract_tariffs_from_url,
+)
 
-# Resoluciones tarifarias vigentes (extraídas de facturas reales)
-RESOLUCIONES = {
-    "Res.1176/25 Anexo 6": {
-        "vigencia_desde": "2025-12-01",
-        "vigencia_hasta": "2025-12-31",
-        "tarifas": {
-            "T1R": {  # Monotributista - IVA 27%
-                "nombre": "Tarifa 1 Residencial",
-                "descripcion": "Monotributista - IVA 27%",
-                "iva": 0.27,
-                "escalones": [
-                    {"num": 1, "desde": 0, "hasta": 150, "cargo_fijo": 5200.00, "precio_kwh": 158.50},
-                    {"num": 2, "desde": 150, "hasta": 200, "cargo_fijo": 6100.00, "precio_kwh": 162.80},
-                    {"num": 3, "desde": 200, "hasta": 400, "cargo_fijo": 6895.82, "precio_kwh": 165.4024},
-                    {"num": 4, "desde": 400, "hasta": 500, "cargo_fijo": 8846.72, "precio_kwh": 173.6190},
-                    {"num": 5, "desde": 500, "hasta": 600, "cargo_fijo": 10500.00, "precio_kwh": 182.50},
-                    {"num": 6, "desde": 600, "hasta": 99999, "cargo_fijo": 12500.00, "precio_kwh": 195.80},
-                ],
-                "ctt_por_kwh": 9.8780,  # CTT Art 5º Res 2019-189 (Dic 2025)
-            },
-            "T1RE": {  # Consumidor Final - IVA 21%
-                "nombre": "Tarifa 1 Residencial Exento",
-                "descripcion": "Consumidor Final - IVA 21%",
-                "iva": 0.21,
-                "escalones": [
-                    {"num": 1, "desde": 0, "hasta": 500, "cargo_fijo": 11911.11, "precio_kwh": 206.6378},
-                    {"num": 2, "desde": 500, "hasta": 99999, "cargo_fijo": 15000.00, "precio_kwh": 225.00},
-                ],
-                "ctt_por_kwh": 4.2020,  # CTT menor para T1RE
-            },
-        },
-    },
+# ---------------------------------------------------------------------------
+# PATHS
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOCS_DIR = os.path.join(BASE_DIR, "docs", "cuadros-tarifarios")
+
+PDF_EXAMPLES = {
+    "Anexo 6 (N1 - Precio completo)": os.path.join(DOCS_DIR, "IF-2026-01658521-GDEBA-GMOCEBA (1).pdf"),
+    "Anexo 14 (N2 - Subsidio hasta 350 kWh)": os.path.join(DOCS_DIR, "IF-2026-01666577-GDEBA-GMOCEBA.pdf"),
+    "Anexo 104 (N3 - Tarifa Social)": os.path.join(DOCS_DIR, "IF-2025-45079914-GDEBA-GMOCEBA.pdf"),
 }
 
-# Impuestos y contribuciones (valores reales de facturas)
-# Base de cálculo: Subtotal Energía
+# URL de la página de OCEBA con cuadros tarifarios
+OCEBA_TARIFAS_URL = "https://oceba.gba.gov.ar/nueva_web/s.php?i=17"
+
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
+
+# Impuestos y leyes (sobre subtotal energía)
 IMPUESTOS = {
-    "ley_7290": {
-        "nombre": "Ley Provincial 7290",
-        "porcentaje": 0.04,  # 4%
+    "iva": {"nombre": "I.V.A.", "porcentaje": None},  # varía por cliente
+    "ley_7290": {"nombre": "Ley Provincial 7290", "porcentaje": 0.04},
+    "art_75": {"nombre": "Ley 11769 Art 75 (6%- Ex.9226)", "porcentaje": 0.06},
+    "art_72bis": {"nombre": "Ley 11769 art.72 Bis (0,001%)", "porcentaje": 0.00001},
+    "fondo": {"nombre": "Ley 11769 Fondo Compensador", "porcentaje": 0.055},
+}
+
+# CTT de resolución OCEBA separada (Res 2019-189)
+CTT_POR_KWH = {"T1R": 9.8780, "T1RE": 4.2020}
+
+# Alumbrado público
+ALUMBRADO_PUBLICO = {1: 14000.00}
+
+# Otros conceptos (punto de venta aparte)
+OTROS_CONCEPTOS_PORCENTAJE_RES_ASAM = 0.1346  # ~13.46% subtotal energía
+BOMBEROS = 960.00
+
+# Tarifa ANTERIOR (hardcoded de la demo vieja, sirve para comparar)
+TARIFAS_ANTERIORES = {
+    "T1R": {
+        "nombre": "Tarifa 1 Residencial",
+        "escalones": [
+            {"num": 1, "nombre": "R1", "desde": 0, "hasta": 150, "cargo_fijo": 5200.00, "cargo_variable": 158.50},
+            {"num": 2, "nombre": "R2", "desde": 150, "hasta": 200, "cargo_fijo": 6100.00, "cargo_variable": 162.80},
+            {"num": 3, "nombre": "R3", "desde": 200, "hasta": 400, "cargo_fijo": 6895.82, "cargo_variable": 165.40},
+            {"num": 4, "nombre": "R4", "desde": 400, "hasta": 500, "cargo_fijo": 8846.72, "cargo_variable": 173.62},
+            {"num": 5, "nombre": "R5", "desde": 500, "hasta": 600, "cargo_fijo": 10500.00, "cargo_variable": 182.50},
+            {"num": 6, "nombre": "R6", "desde": 600, "hasta": 99999, "cargo_fijo": 12500.00, "cargo_variable": 195.80},
+        ],
     },
-    "ley_11769_art75": {
-        "nombre": "Ley 11769 Art 75 (6%- Ex.9226)",
-        "porcentaje": 0.06,  # 6%
-    },
-    "ley_11769_art72bis": {
-        "nombre": "Ley 11769 art.72 Bis (0,001%)",
-        "porcentaje": 0.00001,  # 0.001%
-    },
-    "ley_11769_fondo": {
-        "nombre": "Ley 11769 Fondo Compensador",
-        "porcentaje": 0.055,  # 5.5%
+    "T1RE": {
+        "nombre": "Tarifa 1 Residencial Estacional",
+        "escalones": [
+            {"num": 1, "nombre": "RE1", "desde": 0, "hasta": 500, "cargo_fijo": 11911.11, "cargo_variable": 206.64},
+            {"num": 2, "nombre": "RE2", "desde": 500, "hasta": 99999, "cargo_fijo": 15000.00, "cargo_variable": 225.00},
+        ],
     },
 }
 
-# Otros cargos (mostrados aparte, NO incluidos en Total Liq. Serv. Públicos)
-OTROS_CONCEPTOS = {
-    "res_asamblea": {
-        "nombre": "Res. Asam 21/10/15",
-        "porcentaje": 0.1346,  # ~13.46% del subtotal energía
-    },
-    "bomberos": {
-        "nombre": "Bomberos",
-        "valor_fijo": 960.00,
-    },
-}
-
-# Alumbrado público por zona
-ALUMBRADO_PUBLICO = {
-    1: {"nombre": "Zona 1", "valor_nov": 9284.00, "valor_dic": 14000.00},
-}
-
-# Clientes de ejemplo (datos reales de las facturas)
+# Clientes demo (datos ofuscados)
 CLIENTES = {
     "10140": {
-        "nombre": "PEREZ DIEGO OBDULIO FABIAN",
-        "direccion": "URRUTIA N° 452 Dto 01",
+        "nombre": "DIEGO P.",
+        "direccion": "Calle *** N. 452",
         "localidad": "GENERAL MADARIAGA",
         "tarifa": "T1R",
         "condicion_iva": "Monotributista",
-        "cuit": "20-32465169-2",
+        "iva": 0.27,
         "segmentacion": "N1",
         "zona_alumbrado": 1,
-        "medidor": "19740904",
-        "servicio": "101400007",
+        "medidor": "197*****",
+        "servicio": "1014*****",
+        "consumo_kwh": 422,
         "historial": [
-            {"periodo": "2025-07", "kwh": 280, "total": 78500.00},
-            {"periodo": "2025-08", "kwh": 310, "total": 85200.00},
-            {"periodo": "2025-09", "kwh": 295, "total": 82100.00},
-            {"periodo": "2025-10", "kwh": 320, "total": 88900.00},
-            {"periodo": "2025-11", "kwh": 296, "total": 90713.36},
-            {"periodo": "2025-12", "kwh": 422, "total": 137909.74},
+            {"periodo": "2025-07", "kwh": 280},
+            {"periodo": "2025-08", "kwh": 310},
+            {"periodo": "2025-09", "kwh": 295},
+            {"periodo": "2025-10", "kwh": 320},
+            {"periodo": "2025-11", "kwh": 296},
+            {"periodo": "2025-12", "kwh": 422},
         ],
     },
     "1564": {
-        "nombre": "CRINIGAN MARIA CRISTINA",
-        "direccion": "ZUBIAURRE N° 209",
+        "nombre": "CRISTINA C.",
+        "direccion": "Calle *** N. 209",
         "localidad": "GENERAL MADARIAGA",
         "tarifa": "T1RE",
         "condicion_iva": "Consumidor Final",
-        "dni": "3324947",
+        "iva": 0.21,
         "segmentacion": "N1",
         "zona_alumbrado": 1,
-        "medidor": "31532773",
-        "servicio": "15640027",
+        "medidor": "315*****",
+        "servicio": "1564*****",
+        "consumo_kwh": 170,
         "historial": [
-            {"periodo": "2025-07", "kwh": 65, "total": 42300.00},
-            {"periodo": "2025-08", "kwh": 72, "total": 45800.00},
-            {"periodo": "2025-09", "kwh": 58, "total": 39500.00},
-            {"periodo": "2025-10", "kwh": 61, "total": 41200.00},
-            {"periodo": "2025-11", "kwh": 44, "total": 37642.79},
-            {"periodo": "2025-12", "kwh": 170, "total": 79270.15},
+            {"periodo": "2025-07", "kwh": 65},
+            {"periodo": "2025-08", "kwh": 72},
+            {"periodo": "2025-09", "kwh": 58},
+            {"periodo": "2025-10", "kwh": 61},
+            {"periodo": "2025-11", "kwh": 44},
+            {"periodo": "2025-12", "kwh": 170},
+        ],
+    },
+    "20331": {
+        "nombre": "CARLOS M.",
+        "direccion": "Av. *** N. 1205",
+        "localidad": "GENERAL MADARIAGA",
+        "tarifa": "T1R",
+        "condicion_iva": "Monotributista",
+        "iva": 0.27,
+        "segmentacion": "N1",
+        "zona_alumbrado": 1,
+        "medidor": "224*****",
+        "servicio": "2033*****",
+        "consumo_kwh": 180,
+        "historial": [
+            {"periodo": "2025-07", "kwh": 195},
+            {"periodo": "2025-08", "kwh": 210},
+            {"periodo": "2025-09", "kwh": 175},
+            {"periodo": "2025-10", "kwh": 190},
+            {"periodo": "2025-11", "kwh": 165},
+            {"periodo": "2025-12", "kwh": 180},
+        ],
+    },
+    "5892": {
+        "nombre": "MARIA L.",
+        "direccion": "Calle *** N. 87",
+        "localidad": "GENERAL MADARIAGA",
+        "tarifa": "T1RE",
+        "condicion_iva": "Consumidor Final",
+        "iva": 0.21,
+        "segmentacion": "N1",
+        "zona_alumbrado": 1,
+        "medidor": "412*****",
+        "servicio": "5892*****",
+        "consumo_kwh": 320,
+        "historial": [
+            {"periodo": "2025-07", "kwh": 285},
+            {"periodo": "2025-08", "kwh": 310},
+            {"periodo": "2025-09", "kwh": 275},
+            {"periodo": "2025-10", "kwh": 340},
+            {"periodo": "2025-11", "kwh": 290},
+            {"periodo": "2025-12", "kwh": 320},
+        ],
+    },
+    "30102": {
+        "nombre": "ROBERTO S.",
+        "direccion": "Ruta *** Km 12",
+        "localidad": "GENERAL MADARIAGA",
+        "tarifa": "T1R",
+        "condicion_iva": "Monotributista",
+        "iva": 0.27,
+        "segmentacion": "N1",
+        "zona_alumbrado": 1,
+        "medidor": "508*****",
+        "servicio": "3010*****",
+        "consumo_kwh": 580,
+        "historial": [
+            {"periodo": "2025-07", "kwh": 520},
+            {"periodo": "2025-08", "kwh": 545},
+            {"periodo": "2025-09", "kwh": 510},
+            {"periodo": "2025-10", "kwh": 560},
+            {"periodo": "2025-11", "kwh": 535},
+            {"periodo": "2025-12", "kwh": 580},
+        ],
+    },
+    "7721": {
+        "nombre": "ANA G.",
+        "direccion": "Calle *** N. 33",
+        "localidad": "GENERAL MADARIAGA",
+        "tarifa": "T1R",
+        "condicion_iva": "Monotributista",
+        "iva": 0.27,
+        "segmentacion": "N1",
+        "zona_alumbrado": 1,
+        "medidor": "189*****",
+        "servicio": "7721*****",
+        "consumo_kwh": 95,
+        "historial": [
+            {"periodo": "2025-07", "kwh": 88},
+            {"periodo": "2025-08", "kwh": 102},
+            {"periodo": "2025-09", "kwh": 78},
+            {"periodo": "2025-10", "kwh": 92},
+            {"periodo": "2025-11", "kwh": 85},
+            {"periodo": "2025-12", "kwh": 95},
         ],
     },
 }
 
+# Procedimiento de facturación (42 pasos)
+PROCEDIMIENTO = [
+    (1, "Descarga consumos SgiMovil", False),
+    (2, "División/Ajuste de consumos", False),
+    (3, "Cargar Cuadro Tarifario", True),
+    (4, "Cargar tasa interés OCEBA", False),
+    (5, "Cargar Padrón ARBA", False),
+    (6, "Cargar tasa alumbrado público", False),
+    (7, "Cargar Padrón Subsidio RASE", True),
+    (8, "Sincronizar Perfil Tarifa Social", True),
+    (9, "Generar Intereses (entre 15 y 18)", False),
+    (10, "Cargar archivo Multas", False),
+    (11, "Proceso pre facturación", True),
+    (12, "Reportes usuarios activos/no activos", False),
+    (13, "Reportes lecturas fuera de fecha", False),
+    (14, "Ejecutar validador Pre-Facturación", True),
+    (15, "Cargar CESP", False),
+    (16, "GENERAR - CONTROLAR - CERRAR Facturación", True),
+    (17, "Generar Otros Servicios", False),
+    (18, "Controlar cant. usuarios vs ruta", False),
+    (19, "Cerrar Otros Servicios", False),
+    (20, "Ejecutar validador POST-Facturación", True),
+    (21, "Conciliación Recibo/Factura", False),
+    (22, "Conciliación Factura Negativa", False),
+    (23, "Generación de Cupones", False),
+    (24, "Generación QR de Cupones", False),
+    (25, "Impresión masiva en papel", False),
+    (26, "Impresión masiva en PDF", False),
+    (27, "Publicación PDF en Oficina Virtual", False),
+    (28, "Envío PDF por mail", False),
+    (29, "Envío archivos RIPSA", False),
+    (30, "Envío archivos BANELCO", False),
+    (31, "Envío archivos LINK", False),
+    (32, "Envío archivos DÉBITOS VISA", False),
+    (33, "Envío archivos Mercado Pago", False),
+    (34, "Envío archivos Botón Macro", False),
+    (35, "Envío facturas Municipalidad", False),
+    (36, "Envío facturas Fedecoba", False),
+    (37, "Envío facturas OCEBA Bomberos", False),
+    (38, "Envío consumo Coto p/ Cammesa", False),
+    (39, "Envío OCEBA protocolo A", False),
+    (40, "Agregado tarifario", False),
+    (41, "Envío OCEBA violencia de género", False),
+    (42, "Envío OCEBA entidades bien público", False),
+]
+
 
 # ============================================
-# FUNCIONES DE CÁLCULO
+# MOTOR DE FACTURACIÓN
 # ============================================
 
-def obtener_escalon(tarifa: str, kwh: int, resolucion: str = "Res.1176/25 Anexo 6") -> Dict:
-    """Obtiene el escalón correspondiente según el consumo."""
-    escalones = RESOLUCIONES[resolucion]["tarifas"][tarifa]["escalones"]
-    for escalon in escalones:
-        if escalon["desde"] <= kwh < escalon["hasta"]:
-            return escalon
+def obtener_escalon(tarifa: str, kwh: int, tarifas: dict) -> dict:
+    """Obtiene el escalón correspondiente según tarifa y consumo."""
+    escalones = tarifas[tarifa]["escalones"]
+    for e in escalones:
+        if e["desde"] <= kwh < e["hasta"]:
+            return e
     return escalones[-1]
 
 
-def calcular_factura(
-    tarifa: str,
-    kwh: int,
-    zona_alumbrado: int = 1,
-    periodo: str = "2025-12",
-    resolucion: str = "Res.1176/25 Anexo 6"
-) -> Dict:
-    """
-    Calcula todos los componentes de una factura eléctrica.
-    Fórmula real basada en facturas de COEMA:
+def calcular_factura(tarifa: str, kwh: int, iva_rate: float, tarifas: dict,
+                     zona_alumbrado: int = 1) -> dict:
+    """Calcula todos los componentes de una factura eléctrica."""
+    escalon = obtener_escalon(tarifa, kwh, tarifas)
 
-    Total = Subtotal Energía + Subtotal Leyes + Alumbrado
-
-    Donde Subtotal Leyes = IVA + Ley 7290 + Ley 11769 (Art75 + Art72bis + Fondo)
-    """
-    config_tarifa = RESOLUCIONES[resolucion]["tarifas"][tarifa]
-    escalon = obtener_escalon(tarifa, kwh, resolucion)
-
-    # ===== COMPONENTES DE ENERGÍA =====
+    # Energía
     cargo_fijo = escalon["cargo_fijo"]
-    cargo_variable = kwh * escalon["precio_kwh"]
-    ctt = kwh * config_tarifa["ctt_por_kwh"]
-
+    cargo_variable = kwh * escalon["cargo_variable"]
+    ctt = kwh * CTT_POR_KWH.get(tarifa, 0)
     subtotal_energia = cargo_fijo + cargo_variable + ctt
 
-    # ===== IVA (sobre subtotal energía) =====
-    iva = subtotal_energia * config_tarifa["iva"]
+    # Impuestos (sobre subtotal energía)
+    iva = subtotal_energia * iva_rate
+    ley_7290 = subtotal_energia * 0.04
+    art_75 = subtotal_energia * 0.06
+    art_72bis = subtotal_energia * 0.00001
+    fondo = subtotal_energia * 0.055
+    subtotal_leyes = iva + ley_7290 + art_75 + art_72bis + fondo
 
-    # ===== LEYES (sobre subtotal energía) =====
-    ley_7290 = subtotal_energia * IMPUESTOS["ley_7290"]["porcentaje"]
-    ley_11769_art75 = subtotal_energia * IMPUESTOS["ley_11769_art75"]["porcentaje"]
-    ley_11769_art72bis = subtotal_energia * IMPUESTOS["ley_11769_art72bis"]["porcentaje"]
-    ley_11769_fondo = subtotal_energia * IMPUESTOS["ley_11769_fondo"]["porcentaje"]
+    # Alumbrado
+    alumbrado = ALUMBRADO_PUBLICO.get(zona_alumbrado, 14000.00)
 
-    # Subtotal Leyes incluye IVA + todas las leyes
-    subtotal_leyes = iva + ley_7290 + ley_11769_art75 + ley_11769_art72bis + ley_11769_fondo
-
-    # ===== ALUMBRADO PÚBLICO =====
-    alumbrado_key = "valor_dic" if "12" in periodo else "valor_nov"
-    alumbrado = ALUMBRADO_PUBLICO[zona_alumbrado][alumbrado_key]
-
-    # ===== TOTAL LIQUIDACIÓN SERVICIOS PÚBLICOS =====
+    # Total Liquidación Servicios Públicos
     total = subtotal_energia + subtotal_leyes + alumbrado
 
-    # ===== OTROS CONCEPTOS (mostrados aparte) =====
-    res_asamblea = subtotal_energia * OTROS_CONCEPTOS["res_asamblea"]["porcentaje"]
-    bomberos = OTROS_CONCEPTOS["bomberos"]["valor_fijo"]
-    total_otros_conceptos = res_asamblea + bomberos
+    # Otros conceptos (punto de venta aparte)
+    res_asamblea = subtotal_energia * OTROS_CONCEPTOS_PORCENTAJE_RES_ASAM
+    total_otros = res_asamblea + BOMBEROS
+
+    iva_label = "Monotributo IVA 27%" if iva_rate == 0.27 else f"I.V.A. {iva_rate*100:.0f}%"
 
     return {
+        "escalon": escalon,
         "desglose": [
-            {"concepto": f"Cargo Fijo {tarifa}", "importe": cargo_fijo, "tipo": "energia"},
-            {"concepto": f"Cargo Variable {tarifa}", "importe": cargo_variable, "tipo": "energia"},
-            {"concepto": f"CTT Art 5º Resol 2019-189 ({kwh}x{config_tarifa['ctt_por_kwh']:.4f})", "importe": ctt, "tipo": "energia"},
+            {"concepto": f"Cargo Fijo {tarifa} ({escalon['nombre']})", "importe": cargo_fijo, "tipo": "energia"},
+            {"concepto": f"Cargo Variable {tarifa} ({kwh} kWh x ${escalon['cargo_variable']:.4f})", "importe": cargo_variable, "tipo": "energia"},
+            {"concepto": f"CTT Art 5° Resol 2019-189 ({kwh} x {CTT_POR_KWH.get(tarifa, 0):.4f})", "importe": ctt, "tipo": "energia"},
             {"concepto": "Subtotal Energía", "importe": subtotal_energia, "tipo": "subtotal"},
-            {"concepto": f"{'Monotributo IVA' if config_tarifa['iva'] == 0.27 else 'I.V.A.'} {config_tarifa['iva']*100:.0f}%", "importe": iva, "tipo": "ley"},
+            {"concepto": iva_label, "importe": iva, "tipo": "ley"},
             {"concepto": "Ley Provincial 7290", "importe": ley_7290, "tipo": "ley"},
-            {"concepto": "Ley 11769 Art 75 (6%- Ex.9226)", "importe": ley_11769_art75, "tipo": "ley"},
-            {"concepto": "Ley 11769 art.72 Bis (0,001%)", "importe": ley_11769_art72bis, "tipo": "ley"},
-            {"concepto": "Ley 11769 Fondo Compensador", "importe": ley_11769_fondo, "tipo": "ley"},
+            {"concepto": "Ley 11769 Art 75 (6%- Ex.9226)", "importe": art_75, "tipo": "ley"},
+            {"concepto": "Ley 11769 art.72 Bis (0,001%)", "importe": art_72bis, "tipo": "ley"},
+            {"concepto": "Ley 11769 Fondo Compensador", "importe": fondo, "tipo": "ley"},
             {"concepto": "Subtotal Leyes", "importe": subtotal_leyes, "tipo": "subtotal"},
             {"concepto": "Alumbrado Público ord 2945/23", "importe": alumbrado, "tipo": "otro"},
-            {"concepto": "Subtotal Otros Conceptos", "importe": alumbrado, "tipo": "subtotal"},
         ],
         "otros_conceptos": [
             {"concepto": "Res. Asam 21/10/15", "importe": res_asamblea},
-            {"concepto": "Bomberos", "importe": bomberos},
-            {"concepto": "TOTAL", "importe": total_otros_conceptos},
+            {"concepto": "Bomberos", "importe": BOMBEROS},
+            {"concepto": "TOTAL", "importe": total_otros},
         ],
         "resumen": {
             "subtotal_energia": subtotal_energia,
@@ -219,417 +330,754 @@ def calcular_factura(
             "subtotal_leyes": subtotal_leyes,
             "alumbrado": alumbrado,
             "total": total,
-            "otros_conceptos": total_otros_conceptos,
+            "otros_conceptos": total_otros,
+            "total_general": total + total_otros,
         },
-        "escalon": escalon,
-        "tarifa_config": config_tarifa,
     }
 
 
-def formatear_moneda(valor: float) -> str:
-    """Formatea un valor como moneda argentina."""
+def fmt(valor: float) -> str:
+    """Formatea como moneda argentina."""
     return f"${valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 # ============================================
-# INTERFAZ STREAMLIT
+# SESSION STATE
+# ============================================
+
+def init_state():
+    defaults = {
+        'paso': 1,
+        'datos_oceba': None,
+        'datos_validados': False,
+        'resultados_facturacion': None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+def ir_a_paso(n):
+    st.session_state.paso = n
+
+
+# ============================================
+# COMPONENTES UI
+# ============================================
+
+def render_stepper(paso_actual: int):
+    """Indicador de pasos clickable en la parte superior."""
+    nombres = ["Datos OCEBA", "Validación", "Padrón Socios", "Facturación"]
+    # Determinar qué pasos son accesibles
+    puede_ir = {
+        1: True,
+        2: st.session_state.datos_oceba is not None,
+        3: st.session_state.datos_validados,
+        4: st.session_state.datos_validados,
+    }
+    cols = st.columns(len(nombres))
+    for i, (col, nombre) in enumerate(zip(cols, nombres)):
+        n = i + 1
+        with col:
+            if n == paso_actual:
+                st.button(f"▶ Paso {n} - {nombre}", key=f"step_{n}",
+                          disabled=True, type="primary", use_container_width=True)
+            elif n < paso_actual:
+                st.button(f"✓ Paso {n} - {nombre}", key=f"step_{n}",
+                          on_click=ir_a_paso, args=(n,), use_container_width=True)
+            elif puede_ir.get(n, False):
+                st.button(f"Paso {n} - {nombre}", key=f"step_{n}",
+                          on_click=ir_a_paso, args=(n,), use_container_width=True)
+            else:
+                st.button(f"Paso {n} - {nombre}", key=f"step_{n}",
+                          disabled=True, use_container_width=True)
+
+
+def render_sidebar():
+    """Sidebar con resumen del procedimiento y métricas."""
+    with st.sidebar:
+        st.header("Motor de Facturación")
+        st.caption("COEMA - Gral. Madariaga")
+        st.divider()
+
+        st.subheader("Procedimiento Actual")
+        pasos_auto = sum(1 for _, _, auto in PROCEDIMIENTO if auto)
+        c1, c2 = st.columns(2)
+        c1.metric("Total pasos", len(PROCEDIMIENTO))
+        c2.metric("Automatizados", pasos_auto)
+
+        st.metric("Tiempo ahorrado estimado", "~4 días/mes")
+        st.caption("Paso 3 (Cargar Cuadro Tarifario) hoy toma 3-4 días de carga manual. "
+                   "Con el motor: 30 segundos.")
+
+        with st.expander("Ver los 42 pasos del procedimiento"):
+            for num, desc, auto in PROCEDIMIENTO:
+                if auto:
+                    st.markdown(f":robot_face: ~~{num}. {desc}~~  **Automatizado**")
+                else:
+                    st.markdown(f":white_circle: {num}. {desc}")
+
+        st.divider()
+        st.caption("Pasos automatizados: 3, 7, 8, 11, 14, 16, 20")
+        st.caption("Próximos: 23-28 (generación y distribución), 29-34 (medios de pago)")
+
+        st.divider()
+        if st.session_state.datos_oceba:
+            d = st.session_state.datos_oceba
+            st.success(f"Cuadro cargado: Anexo {d['anexo']} ({d['nivel']})")
+            for cod, tar in d['tarifas'].items():
+                st.caption(f"{cod}: {len(tar['escalones'])} escalones")
+
+
+def render_navegacion(puede_avanzar: bool = True):
+    """Botones de navegación Anterior/Siguiente."""
+    paso = st.session_state.paso
+    st.divider()
+    c1, c2, c3 = st.columns([1, 2, 1])
+    if paso > 1:
+        c1.button(":arrow_left: Anterior", on_click=ir_a_paso, args=(paso - 1,),
+                  use_container_width=True)
+    if paso < 4 and puede_avanzar:
+        c3.button("Siguiente :arrow_right:", on_click=ir_a_paso, args=(paso + 1,),
+                  type="primary", use_container_width=True)
+
+
+# ============================================
+# PASO 1: DATOS OCEBA
+# ============================================
+
+def render_paso_1():
+    st.header("Paso 1: Obtener Datos de OCEBA")
+    st.markdown("Obtenga el cuadro tarifario publicado por OCEBA. "
+                "El sistema extrae automáticamente los valores de cada escalón.")
+
+    tab_url, tab_upload, tab_example = st.tabs([
+        "Descargar desde OCEBA",
+        "Subir PDF",
+        "Usar PDF de ejemplo",
+    ])
+
+    # --- TAB 1: DESCARGAR DESDE OCEBA ---
+    with tab_url:
+        st.markdown(
+            f"Los cuadros tarifarios se publican en la web de OCEBA: "
+            f"[oceba.gba.gov.ar/nueva_web/s.php?i=17]({OCEBA_TARIFAS_URL})"
+        )
+        st.markdown("Copie la URL del PDF del cuadro tarifario que desea cargar y péguela aquí.")
+
+        pdf_url = st.text_input(
+            "URL del PDF de OCEBA",
+            placeholder="https://oceba.gba.gov.ar/.../IF-2026-XXXXX-GDEBA-GMOCEBA.pdf",
+            help="Pegue la URL directa al PDF del cuadro tarifario desde la web de OCEBA",
+        )
+        if st.button("Descargar y extraer datos", type="primary", key="btn_url"):
+            if not pdf_url:
+                st.warning("Ingrese la URL del PDF.")
+            elif not pdf_url.lower().endswith('.pdf'):
+                st.warning("La URL debe apuntar a un archivo PDF.")
+            else:
+                try:
+                    with st.spinner("Descargando PDF desde OCEBA..."):
+                        time.sleep(0.5)
+                        data = extract_tariffs_from_url(pdf_url)
+                    _mostrar_resultado_extraccion(data, f"Descargado desde: {pdf_url}")
+                except Exception as e:
+                    st.error(f"No se pudo descargar el PDF: {e}")
+                    st.info("Puede intentar descargarlo manualmente y subirlo en la pestaña **Subir PDF**.")
+
+    # --- TAB 2: SUBIR PDF ---
+    with tab_upload:
+        uploaded = st.file_uploader(
+            "Arrastre aquí el PDF de Resolución OCEBA",
+            type="pdf",
+            help="PDFs de cuadros tarifarios descargados de oceba.gba.gov.ar",
+        )
+        if uploaded:
+            with st.spinner("Extrayendo datos del PDF..."):
+                time.sleep(0.5)
+                data = extract_tariffs_from_bytes(uploaded.read())
+            _mostrar_resultado_extraccion(data, f"Archivo: {uploaded.name}")
+
+    # --- TAB 3: USAR PDF DE EJEMPLO ---
+    with tab_example:
+        st.markdown("PDFs de cuadros tarifarios disponibles en el sistema:")
+        selected = st.radio(
+            "Seleccione un cuadro tarifario",
+            options=list(PDF_EXAMPLES.keys()),
+            index=0,
+        )
+        if st.button("Extraer datos del PDF", type="primary", key="btn_example"):
+            pdf_path = PDF_EXAMPLES[selected]
+            if os.path.exists(pdf_path):
+                with st.spinner("Extrayendo datos del PDF..."):
+                    time.sleep(0.5)
+                    data = extract_tariffs_from_pdf(pdf_path)
+                _mostrar_resultado_extraccion(data, f"Archivo: {os.path.basename(pdf_path)}")
+            else:
+                st.error(f"No se encontró el archivo: {pdf_path}")
+
+    puede_avanzar = st.session_state.datos_oceba is not None
+    render_navegacion(puede_avanzar)
+
+
+def _mostrar_resultado_extraccion(data: dict, fuente: str = ""):
+    """Muestra resultados de extracción y guarda en session state."""
+    if not data.get('tarifas'):
+        st.error("No se pudieron extraer datos tarifarios del PDF. "
+                 "Verifique que sea un cuadro tarifario OCEBA válido.")
+        return
+
+    st.session_state.datos_oceba = data
+    st.session_state.datos_validados = False
+    st.session_state.resultados_facturacion = None
+
+    st.success(
+        f"Detectado: **Anexo {data['anexo']}** - Nivel **{data['nivel']}** "
+        f"({data['descripcion']})"
+    )
+    if fuente:
+        st.caption(fuente)
+
+    for cod, tarifa in data['tarifas'].items():
+        st.subheader(f"{cod} - {tarifa['nombre']} ({len(tarifa['escalones'])} escalones)")
+        rows = []
+        for e in tarifa['escalones']:
+            hasta_label = f"{e['hasta']:,}" if e['hasta'] < 99999 else "+"
+            rows.append({
+                "Escalón": e['nombre'],
+                "Rango kWh": f"{e['desde']} - {hasta_label}",
+                "Cargo Fijo ($/mes)": fmt(e['cargo_fijo']),
+                "Cargo Variable ($/kWh)": fmt(e['cargo_variable']),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
+# ============================================
+# PASO 2: VALIDACIÓN
+# ============================================
+
+def render_paso_2():
+    st.header("Paso 2: Validar Cuadro Tarifario")
+
+    data = st.session_state.datos_oceba
+    if data is None:
+        st.warning("Primero debe cargar un cuadro tarifario en el Paso 1.")
+        render_navegacion(False)
+        return
+
+    st.markdown(f"Comparando **Anexo {data['anexo']} ({data['nivel']})** "
+                "con los valores de la resolución anterior. "
+                "Puede editar los valores de Cargo Fijo y Cargo Variable si detecta algún error.")
+
+    # --- Comparación y edición por tarifa ---
+    edited_tarifas = {}
+    for cod in ["T1R", "T1RE"]:
+        if cod not in data['tarifas']:
+            continue
+        nuevos = data['tarifas'][cod]['escalones']
+        anteriores = TARIFAS_ANTERIORES.get(cod, {}).get('escalones', [])
+        ant_map = {e['num']: e for e in anteriores}
+
+        st.subheader(f"{cod} - {data['tarifas'][cod]['nombre']}")
+
+        if len(nuevos) != len(anteriores):
+            st.info(f"Cantidad de escalones cambió: {len(anteriores)} :arrow_right: {len(nuevos)}")
+
+        # Comparación con anterior (read-only, en expander)
+        with st.expander("Ver comparación con resolución anterior", expanded=False):
+            comp_rows = []
+            for e in nuevos:
+                ant = ant_map.get(e['num'])
+                if ant:
+                    delta_cf = ((e['cargo_fijo'] - ant['cargo_fijo']) / ant['cargo_fijo'] * 100) if ant['cargo_fijo'] else 0
+                    delta_cv = ((e['cargo_variable'] - ant['cargo_variable']) / ant['cargo_variable'] * 100) if ant['cargo_variable'] else 0
+                    comp_rows.append({
+                        "Esc.": e['nombre'],
+                        "CF Anterior": fmt(ant['cargo_fijo']),
+                        "CF Nuevo": fmt(e['cargo_fijo']),
+                        "CF %": f"{delta_cf:+.1f}%",
+                        "CV Anterior": fmt(ant['cargo_variable']),
+                        "CV Nuevo": fmt(e['cargo_variable']),
+                        "CV %": f"{delta_cv:+.1f}%",
+                    })
+                else:
+                    comp_rows.append({
+                        "Esc.": e['nombre'],
+                        "CF Anterior": "—",
+                        "CF Nuevo": fmt(e['cargo_fijo']),
+                        "CF %": "NUEVO",
+                        "CV Anterior": "—",
+                        "CV Nuevo": fmt(e['cargo_variable']),
+                        "CV %": "NUEVO",
+                    })
+            st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True)
+
+        # Tabla editable con valores extraídos
+        edit_rows = []
+        for e in nuevos:
+            hasta_label = e['hasta'] if e['hasta'] < 99999 else 99999
+            edit_rows.append({
+                "Escalón": e['nombre'],
+                "Desde kWh": e['desde'],
+                "Hasta kWh": hasta_label,
+                "Cargo Fijo ($/mes)": e['cargo_fijo'],
+                "Cargo Variable ($/kWh)": e['cargo_variable'],
+            })
+
+        edited_df = st.data_editor(
+            pd.DataFrame(edit_rows),
+            column_config={
+                "Escalón": st.column_config.TextColumn("Escalón", disabled=True),
+                "Desde kWh": st.column_config.NumberColumn("Desde kWh", disabled=True),
+                "Hasta kWh": st.column_config.NumberColumn("Hasta kWh", disabled=True),
+                "Cargo Fijo ($/mes)": st.column_config.NumberColumn(
+                    "Cargo Fijo ($/mes)", format="%.2f", min_value=0.0,
+                ),
+                "Cargo Variable ($/kWh)": st.column_config.NumberColumn(
+                    "Cargo Variable ($/kWh)", format="%.4f", min_value=0.0,
+                ),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key=f"editor_{cod}",
+        )
+        edited_tarifas[cod] = edited_df
+
+    # CTT info
+    st.subheader("CTT (Compensación Tarifaria Transitoria)")
+    st.caption("Valores de la Res 2019-189 (cargados manualmente, fuente separada)")
+    ctt_rows = [{"Tarifa": k, "CTT $/kWh": fmt(v)} for k, v in CTT_POR_KWH.items()]
+    st.dataframe(pd.DataFrame(ctt_rows), hide_index=True, use_container_width=True)
+
+    # Confirmar
+    st.divider()
+    if st.button(":white_check_mark: Confirmar y aplicar cuadro tarifario", type="primary",
+                 use_container_width=True):
+        # Aplicar valores editados al session state
+        for cod, edited_df in edited_tarifas.items():
+            escalones = data['tarifas'][cod]['escalones']
+            for i, row in edited_df.iterrows():
+                escalones[i]['cargo_fijo'] = row['Cargo Fijo ($/mes)']
+                escalones[i]['cargo_variable'] = row['Cargo Variable ($/kWh)']
+        st.session_state.datos_validados = True
+        st.session_state.resultados_facturacion = None
+        st.success("Cuadro tarifario validado y aplicado.")
+
+    render_navegacion(st.session_state.datos_validados)
+
+
+# ============================================
+# PASO 3: PADRÓN DE SOCIOS
+# ============================================
+
+def render_paso_3():
+    st.header("Paso 3: Padrón de Socios")
+
+    if not st.session_state.datos_validados:
+        st.warning("Primero debe validar el cuadro tarifario en el Paso 2.")
+        render_navegacion(False)
+        return
+
+    st.markdown("Socios cargados para el período de facturación. "
+                "En producción, estos datos vienen del sistema de lecturas (SgiMovil).")
+
+    tarifas = st.session_state.datos_oceba['tarifas']
+
+    rows = []
+    for cid, c in CLIENTES.items():
+        escalon = obtener_escalon(c['tarifa'], c['consumo_kwh'], tarifas) if c['tarifa'] in tarifas else None
+        rows.append({
+            "Socio": cid,
+            "Nombre": c['nombre'],
+            "Tarifa": c['tarifa'],
+            "Segm.": c['segmentacion'],
+            "Cond. IVA": c['condicion_iva'],
+            "Consumo kWh": c['consumo_kwh'],
+            "Escalón": escalon['nombre'] if escalon else "N/A",
+            "Medidor": c['medidor'],
+        })
+
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # Resumen
+    c1, c2, c3, c4 = st.columns(4)
+    total_socios = len(CLIENTES)
+    t1r_count = sum(1 for c in CLIENTES.values() if c['tarifa'] == 'T1R')
+    t1re_count = sum(1 for c in CLIENTES.values() if c['tarifa'] == 'T1RE')
+    avg_kwh = sum(c['consumo_kwh'] for c in CLIENTES.values()) / total_socios
+
+    c1.metric("Total Socios", total_socios)
+    c2.metric("T1R", t1r_count)
+    c3.metric("T1RE", t1re_count)
+    c4.metric("Consumo Promedio", f"{avg_kwh:.0f} kWh")
+
+    st.caption("En producción: ~10.000 servicios en 29-30 rutas de lectura.")
+
+    render_navegacion(True)
+
+
+# ============================================
+# PASO 4: FACTURACIÓN
+# ============================================
+
+def render_paso_4():
+    st.header("Paso 4: Facturación")
+
+    if not st.session_state.datos_validados:
+        st.warning("Debe completar los pasos anteriores primero.")
+        render_navegacion(False)
+        return
+
+    tarifas = st.session_state.datos_oceba['tarifas']
+
+    # Calcular si aún no se hizo
+    if st.session_state.resultados_facturacion is None:
+        if st.button("Generar Facturación", type="primary", use_container_width=True):
+            resultados = {}
+            progress = st.progress(0, text="Calculando facturas...")
+            clientes_list = list(CLIENTES.items())
+            for i, (cid, c) in enumerate(clientes_list):
+                if c['tarifa'] in tarifas:
+                    f = calcular_factura(
+                        tarifa=c['tarifa'],
+                        kwh=c['consumo_kwh'],
+                        iva_rate=c['iva'],
+                        tarifas=tarifas,
+                        zona_alumbrado=c['zona_alumbrado'],
+                    )
+                    resultados[cid] = f
+                progress.progress((i + 1) / len(clientes_list),
+                                  text=f"Calculando {c['nombre']}...")
+                time.sleep(0.3)  # efecto demo
+            progress.empty()
+            st.session_state.resultados_facturacion = resultados
+            st.rerun()
+        return
+
+    resultados = st.session_state.resultados_facturacion
+
+    # Métricas resumen
+    total_facturado = sum(r['resumen']['total'] for r in resultados.values())
+    total_otros = sum(r['resumen']['otros_conceptos'] for r in resultados.values())
+    total_general = sum(r['resumen']['total_general'] for r in resultados.values())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Socios Facturados", len(resultados))
+    c2.metric("Total Liq. Serv. Púb.", fmt(total_facturado))
+    c3.metric("Total Otros Conceptos", fmt(total_otros))
+    c4.metric("Total General", fmt(total_general))
+
+    # Tabs para distintas vistas
+    tab_resumen, tab_detalle, tab_simulador, tab_comparador = st.tabs([
+        "Resumen", "Detalle por Socio", "Simulador", "Comparador"
+    ])
+
+    with tab_resumen:
+        _render_resumen(resultados, tarifas)
+    with tab_detalle:
+        _render_detalle(resultados, tarifas)
+    with tab_simulador:
+        _render_simulador(tarifas)
+    with tab_comparador:
+        _render_comparador(tarifas)
+
+    # Navegación
+    st.divider()
+    c1, _, c3 = st.columns([1, 2, 1])
+    c1.button(":arrow_left: Anterior", on_click=ir_a_paso, args=(3,), use_container_width=True)
+    if c3.button(":arrows_counterclockwise: Recalcular", use_container_width=True):
+        st.session_state.resultados_facturacion = None
+        st.rerun()
+
+
+def _render_resumen(resultados: dict, tarifas: dict):
+    """Resumen de facturación batch."""
+    st.subheader("Resumen de Facturación")
+
+    rows = []
+    for cid, r in resultados.items():
+        c = CLIENTES[cid]
+        rows.append({
+            "Socio": cid,
+            "Nombre": c['nombre'],
+            "Tarifa": c['tarifa'],
+            "kWh": c['consumo_kwh'],
+            "Escalón": r['escalon']['nombre'],
+            "Subtotal Energía": r['resumen']['subtotal_energia'],
+            "Leyes + IVA": r['resumen']['subtotal_leyes'],
+            "Alumbrado": r['resumen']['alumbrado'],
+            "Total": r['resumen']['total'],
+            "Otros": r['resumen']['otros_conceptos'],
+            "Total General": r['resumen']['total_general'],
+        })
+
+    df = pd.DataFrame(rows)
+
+    currency_cols = ["Subtotal Energía", "Leyes + IVA", "Alumbrado", "Total", "Otros", "Total General"]
+    df_display = df.copy()
+    for col in currency_cols:
+        df_display[col] = df_display[col].apply(fmt)
+
+    st.dataframe(df_display, hide_index=True, use_container_width=True)
+
+    # Gráficos
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Total por Socio")
+        fig = px.bar(
+            df, x="Nombre", y="Total", color="Tarifa",
+            text_auto='.2s',
+            color_discrete_map={"T1R": "#3498db", "T1RE": "#e74c3c"},
+        )
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", height=350,
+                          showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        st.subheader("Composición Promedio")
+        avg_energia = df["Subtotal Energía"].mean()
+        avg_leyes = df["Leyes + IVA"].mean()
+        avg_alumbrado = df["Alumbrado"].mean()
+
+        fig = go.Figure(data=[go.Pie(
+            labels=["Energía", "Leyes (inc. IVA)", "Alumbrado"],
+            values=[avg_energia, avg_leyes, avg_alumbrado],
+            hole=0.4,
+            marker_colors=["#27ae60", "#3498db", "#9b59b6"],
+            textinfo="label+percent",
+        )])
+        fig.update_layout(height=350, showlegend=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_detalle(resultados: dict, tarifas: dict):
+    """Detalle de factura individual."""
+    st.subheader("Detalle de Factura")
+
+    cid = st.selectbox(
+        "Seleccione socio",
+        options=list(resultados.keys()),
+        format_func=lambda x: f"Socio {x} - {CLIENTES[x]['nombre']} ({CLIENTES[x]['tarifa']})"
+    )
+
+    c = CLIENTES[cid]
+    f = resultados[cid]
+
+    st.info(f"""
+    **Titular:** {c['nombre']} | **Tarifa:** {c['tarifa']} | **{c['condicion_iva']}** (IVA {c['iva']*100:.0f}%)
+    **Segmentación:** {c['segmentacion']} | **Medidor:** {c['medidor']} | **Consumo:** {c['consumo_kwh']} kWh
+    """)
+
+    col_factura, col_hist = st.columns([3, 2])
+
+    with col_factura:
+        st.markdown("**Liquidación de Servicios Públicos**")
+        for item in f['desglose']:
+            if item['tipo'] == 'subtotal':
+                st.markdown(f"**{item['concepto']}:** **{fmt(item['importe'])}**")
+                st.divider()
+            else:
+                ca, cb = st.columns([3, 1])
+                ca.write(item['concepto'])
+                cb.write(fmt(item['importe']))
+
+        st.success(f"### Total Liq. Serv. Púb.: {fmt(f['resumen']['total'])}")
+
+        with st.expander("Otros Conceptos (punto de venta adicional)"):
+            for item in f['otros_conceptos']:
+                ca, cb = st.columns([3, 1])
+                if item['concepto'] == 'TOTAL':
+                    ca.markdown(f"**{item['concepto']}**")
+                    cb.markdown(f"**{fmt(item['importe'])}**")
+                else:
+                    ca.write(item['concepto'])
+                    cb.write(fmt(item['importe']))
+
+        st.caption(f"**Escalón:** {f['escalon']['nombre']} "
+                   f"({f['escalon']['desde']}-{f['escalon']['hasta'] if f['escalon']['hasta'] < 99999 else '+'} kWh)")
+
+    with col_hist:
+        st.markdown("**Historial de Consumo**")
+        if c['historial']:
+            df_h = pd.DataFrame(c['historial'])
+            fig = px.bar(df_h, x="periodo", y="kwh", text="kwh",
+                         color_discrete_sequence=["#3498db"])
+            fig.update_layout(height=250, showlegend=False,
+                              xaxis_title="", yaxis_title="kWh")
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, use_container_width=True)
+
+            consumos = [h['kwh'] for h in c['historial']]
+            mc1, mc2 = st.columns(2)
+            mc1.metric("Promedio", f"{sum(consumos)/len(consumos):.0f} kWh")
+            mc2.metric("Máximo", f"{max(consumos)} kWh")
+
+
+def _render_simulador(tarifas: dict):
+    """Simulador de consumo."""
+    st.subheader("Simulador de Consumo")
+    st.write("Visualice cómo varía la factura según el consumo.")
+
+    c1, c2 = st.columns([1, 2])
+
+    with c1:
+        tarifa_sim = st.selectbox(
+            "Tarifa",
+            options=[t for t in ["T1R", "T1RE"] if t in tarifas],
+            format_func=lambda x: f"{x} - {tarifas[x]['nombre']}",
+            key="sim_tarifa",
+        )
+        iva_sim = st.selectbox(
+            "Condición IVA",
+            options=[0.27, 0.21],
+            format_func=lambda x: f"Monotributista ({x*100:.0f}%)" if x == 0.27 else f"Consumidor Final ({x*100:.0f}%)",
+            key="sim_iva",
+        )
+        rango = st.slider("Rango de consumo (kWh)", 0, 1000, (50, 500), 25, key="sim_rango")
+
+        st.markdown("**Escalones**")
+        for e in tarifas[tarifa_sim]['escalones']:
+            hasta = f"{e['hasta']}" if e['hasta'] < 99999 else "+"
+            st.caption(f"**{e['nombre']}** ({e['desde']}-{hasta}): "
+                       f"CF={fmt(e['cargo_fijo'])}, CV={fmt(e['cargo_variable'])}/kWh")
+
+    with c2:
+        consumos = list(range(rango[0], rango[1] + 1, 25))
+        totales = []
+        for c in consumos:
+            f = calcular_factura(tarifa_sim, c, iva_sim, tarifas)
+            totales.append(f['resumen']['total'])
+
+        df_sim = pd.DataFrame({"Consumo (kWh)": consumos, "Total Factura": totales})
+
+        fig = px.line(df_sim, x="Consumo (kWh)", y="Total Factura",
+                      title=f"Proyección de Factura - {tarifas[tarifa_sim]['nombre']}",
+                      markers=True)
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f", height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("**Referencia rápida**")
+        refs = [100, 200, 300, 400, 500]
+        ref_data = []
+        for c in refs:
+            f = calcular_factura(tarifa_sim, c, iva_sim, tarifas)
+            ref_data.append({
+                "Consumo": f"{c} kWh",
+                "Total": fmt(f['resumen']['total']),
+                "$/kWh prom.": fmt(f['resumen']['total'] / c) if c > 0 else "-",
+            })
+        st.dataframe(pd.DataFrame(ref_data), hide_index=True, use_container_width=True)
+
+
+def _render_comparador(tarifas: dict):
+    """Comparador de tarifas T1R vs T1RE."""
+    st.subheader("Comparador de Tarifas")
+
+    available = [t for t in ["T1R", "T1RE"] if t in tarifas]
+    if len(available) < 2:
+        st.info("Se necesitan al menos 2 tarifas para comparar.")
+        return
+
+    consumo_comp = st.slider("Consumo a comparar (kWh)", 50, 800, 200, 25, key="comp_consumo")
+
+    comparacion = []
+    for tarifa_key in available:
+        iva = 0.27 if tarifa_key == "T1R" else 0.21
+        f = calcular_factura(tarifa_key, consumo_comp, iva, tarifas)
+        e = f['escalon']
+        comparacion.append({
+            "Tarifa": tarifas[tarifa_key]['nombre'],
+            "Código": tarifa_key,
+            "IVA": f"{iva*100:.0f}%",
+            "Cargo Fijo": e['cargo_fijo'],
+            "Precio kWh": e['cargo_variable'],
+            "Subtotal Energía": f['resumen']['subtotal_energia'],
+            "Total": f['resumen']['total'],
+        })
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        for row in comparacion:
+            with st.container(border=True):
+                st.markdown(f"### {row['Código']}")
+                st.markdown(f"""
+                - **IVA:** {row['IVA']}
+                - **Cargo Fijo:** {fmt(row['Cargo Fijo'])}
+                - **Precio kWh:** {fmt(row['Precio kWh'])}
+                - **Subtotal Energía:** {fmt(row['Subtotal Energía'])}
+                - **TOTAL:** **{fmt(row['Total'])}**
+                """)
+
+        dif = abs(comparacion[0]['Total'] - comparacion[1]['Total'])
+        mas_barata = comparacion[0]['Código'] if comparacion[0]['Total'] < comparacion[1]['Total'] else comparacion[1]['Código']
+        st.success(f"Para {consumo_comp} kWh, **{mas_barata}** es más económica por **{fmt(dif)}**")
+
+    with c2:
+        df_comp = pd.DataFrame(comparacion)
+        fig = px.bar(df_comp, x="Código", y="Total", color="Código",
+                     title=f"Total a pagar por {consumo_comp} kWh",
+                     text_auto='.2s',
+                     color_discrete_map={"T1R": "#3498db", "T1RE": "#e74c3c"})
+        fig.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f",
+                          height=350, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Comparación por rango
+        consumos_rango = list(range(50, 701, 50))
+        data_rango = []
+        for c in consumos_rango:
+            for t in available:
+                iva = 0.27 if t == "T1R" else 0.21
+                f = calcular_factura(t, c, iva, tarifas)
+                data_rango.append({"Consumo": c, "Tarifa": t, "Total": f['resumen']['total']})
+
+        fig2 = px.line(pd.DataFrame(data_rango), x="Consumo", y="Total",
+                       color="Tarifa", markers=True,
+                       color_discrete_map={"T1R": "#3498db", "T1RE": "#e74c3c"})
+        fig2.update_layout(yaxis_tickprefix="$", yaxis_tickformat=",.0f",
+                           height=300, xaxis_title="Consumo (kWh)", yaxis_title="Total ($)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+
+# ============================================
+# APLICACIÓN PRINCIPAL
 # ============================================
 
 st.set_page_config(
-    page_title="COEMA - Facturación",
+    page_title="COEMA - Motor de Facturación",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ COEMA - Sistema de Facturación Eléctrica")
+init_state()
+
+# Header
+st.title("⚡ COEMA - Motor de Facturación Eléctrica")
 st.caption("Cooperativa de Provisión de Energía Eléctrica y Otros Servicios de Madariaga Ltda.")
 
-# Tabs principales
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Calculadora de Factura",
-    "Simulador de Consumo",
-    "Historial de Cliente",
-    "Comparador de Tarifas"
-])
+# Indicador de pasos
+render_stepper(st.session_state.paso)
+st.divider()
 
-# ============================================
-# TAB 1: CALCULADORA DE FACTURA
-# ============================================
-with tab1:
-    st.header("Calculadora de Factura")
+# Contenido según paso actual
+if st.session_state.paso == 1:
+    render_paso_1()
+elif st.session_state.paso == 2:
+    render_paso_2()
+elif st.session_state.paso == 3:
+    render_paso_3()
+elif st.session_state.paso == 4:
+    render_paso_4()
 
-    col1, col2 = st.columns([1, 2])
+# Sidebar
+render_sidebar()
 
-    with col1:
-        st.subheader("Datos de entrada")
-
-        # Selector de cliente
-        cliente_id = st.selectbox(
-            "Seleccione cliente",
-            options=list(CLIENTES.keys()),
-            format_func=lambda x: f"Socio {x} - {CLIENTES[x]['nombre']} ({CLIENTES[x]['tarifa']})"
-        )
-
-        cliente = CLIENTES[cliente_id]
-        tarifa_info = RESOLUCIONES["Res.1176/25 Anexo 6"]["tarifas"][cliente["tarifa"]]
-
-        # Info del cliente
-        st.info(f"""
-        **Titular:** {cliente['nombre']}
-        **Dirección:** {cliente['direccion']}
-        **Tarifa:** {tarifa_info['nombre']}
-        **Condición IVA:** {cliente['condicion_iva']} ({tarifa_info['iva']*100:.0f}%)
-        **Segmentación:** {cliente['segmentacion']}
-        **Medidor:** {cliente['medidor']}
-        """)
-
-        # Input de consumo
-        ultimo_consumo = cliente["historial"][-1]["kwh"] if cliente["historial"] else 200
-        consumo_kwh = st.number_input(
-            "Consumo (kWh)",
-            min_value=0,
-            max_value=2000,
-            value=ultimo_consumo,
-            step=10,
-            help="Ingrese el consumo en kilovatios-hora"
-        )
-
-        periodo = st.selectbox(
-            "Período",
-            options=["2025-12", "2025-11"],
-            format_func=lambda x: "DICIEMBRE/2025" if x == "2025-12" else "NOVIEMBRE/2025"
-        )
-
-        calcular = st.button("Calcular Factura", type="primary", use_container_width=True)
-
-    with col2:
-        if calcular or consumo_kwh > 0:
-            factura = calcular_factura(
-                tarifa=cliente["tarifa"],
-                kwh=consumo_kwh,
-                zona_alumbrado=cliente["zona_alumbrado"],
-                periodo=periodo,
-            )
-
-            st.subheader(f"Liquidación de Servicios Públicos - {periodo}")
-
-            # Mostrar desglose
-            for item in factura["desglose"]:
-                if item["tipo"] == "subtotal":
-                    st.markdown(f"**{item['concepto']}:** **{formatear_moneda(item['importe'])}**")
-                    st.divider()
-                else:
-                    col_a, col_b = st.columns([3, 1])
-                    col_a.write(item["concepto"])
-                    col_b.write(formatear_moneda(item["importe"]))
-
-            # Total destacado
-            st.success(f"### Total Liq. Serv. Públicos: {formatear_moneda(factura['resumen']['total'])}")
-
-            # Otros conceptos (en caja aparte)
-            with st.expander("Otros Conceptos (adicionales)"):
-                for item in factura["otros_conceptos"]:
-                    col_a, col_b = st.columns([3, 1])
-                    if item["concepto"] == "TOTAL":
-                        col_a.markdown(f"**{item['concepto']}**")
-                        col_b.markdown(f"**{formatear_moneda(item['importe'])}**")
-                    else:
-                        col_a.write(item["concepto"])
-                        col_b.write(formatear_moneda(item["importe"]))
-
-            # Info del escalón
-            st.caption(f"""
-            **Escalón aplicado:** {factura['escalon']['num']} ({factura['escalon']['desde']}-{factura['escalon']['hasta']} kWh) |
-            **Cargo Fijo:** {formatear_moneda(factura['escalon']['cargo_fijo'])} |
-            **Precio kWh:** {formatear_moneda(factura['escalon']['precio_kwh'])}
-            """)
-
-            # Gráfico de composición
-            st.subheader("Composición de la Factura")
-
-            fig = go.Figure(data=[go.Pie(
-                labels=["Energía", "Leyes (inc. IVA)", "Alumbrado"],
-                values=[
-                    factura["resumen"]["subtotal_energia"],
-                    factura["resumen"]["subtotal_leyes"],
-                    factura["resumen"]["alumbrado"],
-                ],
-                hole=0.4,
-                marker_colors=["#27ae60", "#3498db", "#9b59b6"],
-                textinfo="label+percent",
-            )])
-            fig.update_layout(height=300, showlegend=True)
-            st.plotly_chart(fig, use_container_width=True)
-
-# ============================================
-# TAB 2: SIMULADOR DE CONSUMO
-# ============================================
-with tab2:
-    st.header("Simulador de Consumo")
-    st.write("Visualice cómo varía el monto de su factura según el consumo")
-
-    col1, col2 = st.columns([1, 2])
-
-    with col1:
-        tarifa_sim = st.selectbox(
-            "Seleccione tarifa",
-            options=["T1R", "T1RE"],
-            format_func=lambda x: f"{x} - {RESOLUCIONES['Res.1176/25 Anexo 6']['tarifas'][x]['nombre']}"
-        )
-
-        rango = st.slider(
-            "Rango de consumo a simular (kWh)",
-            min_value=0,
-            max_value=800,
-            value=(50, 500),
-            step=25
-        )
-
-        st.subheader("Escalones de Tarifa")
-        tarifa_data = RESOLUCIONES["Res.1176/25 Anexo 6"]["tarifas"][tarifa_sim]
-        for esc in tarifa_data["escalones"]:
-            if esc["hasta"] < 99999:
-                st.caption(f"**Esc. {esc['num']}** ({esc['desde']}-{esc['hasta']} kWh): CF={formatear_moneda(esc['cargo_fijo'])}, CV={formatear_moneda(esc['precio_kwh'])}/kWh")
-
-    with col2:
-        # Generar datos de simulación
-        consumos = list(range(rango[0], rango[1] + 1, 25))
-        totales = []
-
-        for c in consumos:
-            f = calcular_factura(tarifa=tarifa_sim, kwh=c, periodo="2025-12")
-            totales.append(f["resumen"]["total"])
-
-        df_sim = pd.DataFrame({
-            "Consumo (kWh)": consumos,
-            "Total Factura": totales,
-        })
-
-        # Gráfico de línea
-        fig = px.line(
-            df_sim,
-            x="Consumo (kWh)",
-            y="Total Factura",
-            title=f"Proyección de Factura - {tarifa_data['nombre']}",
-            markers=True,
-        )
-        fig.update_layout(
-            yaxis_tickprefix="$",
-            yaxis_tickformat=",.0f",
-            height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Tabla de referencia rápida
-        st.subheader("Referencia rápida")
-        consumos_ref = [100, 200, 300, 400, 500]
-        data_ref = []
-        for c in consumos_ref:
-            f = calcular_factura(tarifa=tarifa_sim, kwh=c, periodo="2025-12")
-            data_ref.append({
-                "Consumo": f"{c} kWh",
-                "Total": formatear_moneda(f["resumen"]["total"]),
-                "$/kWh promedio": formatear_moneda(f["resumen"]["total"] / c if c > 0 else 0),
-            })
-        st.dataframe(pd.DataFrame(data_ref), hide_index=True, use_container_width=True)
-
-# ============================================
-# TAB 3: HISTORIAL DE CLIENTE
-# ============================================
-with tab3:
-    st.header("Historial de Cliente")
-
-    cliente_hist_id = st.selectbox(
-        "Seleccione cliente para ver historial",
-        options=list(CLIENTES.keys()),
-        format_func=lambda x: f"Socio {x} - {CLIENTES[x]['nombre']}",
-        key="hist_cliente"
-    )
-
-    cliente_hist = CLIENTES[cliente_hist_id]
-
-    # Info del cliente
-    st.markdown(f"""
-    **Titular:** {cliente_hist['nombre']} | **Tarifa:** {cliente_hist['tarifa']} | **Condición:** {cliente_hist['condicion_iva']}
-    """)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        # Gráfico de consumo histórico
-        df_hist = pd.DataFrame(cliente_hist["historial"])
-
-        fig_consumo = px.bar(
-            df_hist,
-            x="periodo",
-            y="kwh",
-            title="Consumo Histórico (kWh)",
-            color="kwh",
-            color_continuous_scale="Blues",
-            text="kwh",
-        )
-        fig_consumo.update_layout(height=350, showlegend=False)
-        fig_consumo.update_traces(textposition="outside")
-        st.plotly_chart(fig_consumo, use_container_width=True)
-
-    with col2:
-        # Gráfico de facturación histórica
-        fig_factura = px.line(
-            df_hist,
-            x="periodo",
-            y="total",
-            title="Evolución de Facturación ($)",
-            markers=True,
-        )
-        fig_factura.update_layout(
-            yaxis_tickprefix="$",
-            yaxis_tickformat=",.0f",
-            height=350
-        )
-        st.plotly_chart(fig_factura, use_container_width=True)
-
-    # Estadísticas
-    st.subheader("Estadísticas")
-    col1, col2, col3, col4 = st.columns(4)
-
-    consumos = [h["kwh"] for h in cliente_hist["historial"]]
-    totales = [h["total"] for h in cliente_hist["historial"]]
-
-    col1.metric("Consumo Promedio", f"{sum(consumos)/len(consumos):.0f} kWh")
-    col2.metric("Consumo Máximo", f"{max(consumos)} kWh", f"+{max(consumos) - sum(consumos)//len(consumos)} vs prom.")
-    col3.metric("Factura Promedio", formatear_moneda(sum(totales)/len(totales)))
-    col4.metric(
-        "Última Factura",
-        formatear_moneda(totales[-1]),
-        f"{((totales[-1] - totales[-2]) / totales[-2] * 100):+.1f}%" if len(totales) > 1 else None
-    )
-
-    # Tabla detallada
-    st.subheader("Detalle por Período")
-    df_detalle = pd.DataFrame(cliente_hist["historial"])
-    df_detalle["total_fmt"] = df_detalle["total"].apply(formatear_moneda)
-    df_detalle["costo_kwh"] = (df_detalle["total"] / df_detalle["kwh"]).apply(lambda x: formatear_moneda(x))
-    df_detalle = df_detalle.rename(columns={
-        "periodo": "Período",
-        "kwh": "Consumo (kWh)",
-        "total_fmt": "Total Factura",
-        "costo_kwh": "$/kWh"
-    })
-    st.dataframe(df_detalle[["Período", "Consumo (kWh)", "Total Factura", "$/kWh"]], hide_index=True, use_container_width=True)
-
-# ============================================
-# TAB 4: COMPARADOR DE TARIFAS
-# ============================================
-with tab4:
-    st.header("Comparador de Tarifas")
-    st.write("Compare el costo para un mismo consumo entre T1R (Monotributista) y T1RE (Consumidor Final)")
-
-    consumo_comp = st.slider(
-        "Consumo a comparar (kWh)",
-        min_value=50,
-        max_value=600,
-        value=200,
-        step=25,
-    )
-
-    # Calcular para ambas tarifas
-    comparacion = []
-    for tarifa_key in ["T1R", "T1RE"]:
-        tarifa_data = RESOLUCIONES["Res.1176/25 Anexo 6"]["tarifas"][tarifa_key]
-        factura = calcular_factura(tarifa=tarifa_key, kwh=consumo_comp, periodo="2025-12")
-        escalon = factura["escalon"]
-        comparacion.append({
-            "Tarifa": tarifa_data["nombre"],
-            "Código": tarifa_key,
-            "Condición IVA": tarifa_data["descripcion"].split(" - ")[0],
-            "IVA": f"{tarifa_data['iva']*100:.0f}%",
-            "Cargo Fijo": escalon["cargo_fijo"],
-            "Precio kWh": escalon["precio_kwh"],
-            "Subtotal Energía": factura["resumen"]["subtotal_energia"],
-            "Total": factura["resumen"]["total"],
-        })
-
-    df_comp = pd.DataFrame(comparacion)
-
-    # Mostrar comparativa
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Tabla Comparativa")
-
-        # Mostrar cada tarifa en un card
-        for i, row in df_comp.iterrows():
-            with st.container():
-                st.markdown(f"### {row['Código']} - {row['Condición IVA']}")
-                st.markdown(f"""
-                - **IVA:** {row['IVA']}
-                - **Cargo Fijo:** {formatear_moneda(row['Cargo Fijo'])}
-                - **Precio kWh:** {formatear_moneda(row['Precio kWh'])}
-                - **Subtotal Energía:** {formatear_moneda(row['Subtotal Energía'])}
-                - **TOTAL:** **{formatear_moneda(row['Total'])}**
-                """)
-                st.divider()
-
-        diferencia = abs(comparacion[0]["Total"] - comparacion[1]["Total"])
-        mas_barata = "T1R" if comparacion[0]["Total"] < comparacion[1]["Total"] else "T1RE"
-        st.success(f"Para {consumo_comp} kWh, **{mas_barata}** es más económica por **{formatear_moneda(diferencia)}**")
-
-    with col2:
-        st.subheader("Comparación Visual")
-        fig = px.bar(
-            df_comp,
-            x="Código",
-            y="Total",
-            color="Código",
-            title=f"Total a pagar por {consumo_comp} kWh",
-            text_auto='.2s',
-            color_discrete_map={"T1R": "#3498db", "T1RE": "#e74c3c"}
-        )
-        fig.update_layout(
-            yaxis_tickprefix="$",
-            yaxis_tickformat=",.0f",
-            height=400,
-            showlegend=False
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Gráfico de comparación por rango
-        st.subheader("Comparación por Rango de Consumo")
-        consumos_rango = list(range(50, 501, 50))
-        data_rango = []
-        for c in consumos_rango:
-            for t in ["T1R", "T1RE"]:
-                f = calcular_factura(tarifa=t, kwh=c, periodo="2025-12")
-                data_rango.append({"Consumo": c, "Tarifa": t, "Total": f["resumen"]["total"]})
-
-        df_rango = pd.DataFrame(data_rango)
-        fig_rango = px.line(
-            df_rango,
-            x="Consumo",
-            y="Total",
-            color="Tarifa",
-            markers=True,
-            color_discrete_map={"T1R": "#3498db", "T1RE": "#e74c3c"}
-        )
-        fig_rango.update_layout(
-            yaxis_tickprefix="$",
-            yaxis_tickformat=",.0f",
-            height=350,
-            xaxis_title="Consumo (kWh)",
-            yaxis_title="Total Factura ($)"
-        )
-        st.plotly_chart(fig_rango, use_container_width=True)
-
-# ============================================
-# FOOTER
-# ============================================
+# Footer
 st.divider()
 st.caption("""
-**Resolución aplicada:** Res. 1176/25 Anexo 6 (Vigencia: 01/12/2025 al 31/12/2025)
+**COEMA** - Cooperativa de Provisión de Energía Eléctrica y Otros Servicios de Madariaga Ltda.
+Zubiaurre 248 - CP 7163 - Gral. Madariaga | Tel: 02267-424347
 
-**Nota:** Este es un prototipo de demostración basado en facturas reales de Nov-Dic 2025.
-Los valores pueden tener pequeñas diferencias debido al prorrateo entre resoluciones.
-
-*COEMA - Cooperativa de Provisión de Energía Eléctrica y Otros Servicios de Madariaga Ltda.*
-*Zubiaurre 248 - CP 7163 - Gral. Madariaga | Tel: 02267-424347*
+*Motor de Facturación - Demo v2.0*
 """)
